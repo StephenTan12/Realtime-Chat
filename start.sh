@@ -1,0 +1,1 @@
+go build -o ./build/realtime-chat ./app
