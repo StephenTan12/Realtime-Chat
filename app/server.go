@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -17,8 +18,13 @@ type Server struct {
 type ClientsData struct {
 	maxClients        uint8
 	connectedClients  uint8
-	clientConnections []net.Conn
+	clientConnections []ClientData
 	lock              sync.RWMutex
+}
+
+type ClientData struct {
+	name string
+	conn net.Conn
 }
 
 func (s *Server) GetIpAddrStr() string {
@@ -42,7 +48,7 @@ func (s *Server) InitServer(maxClients uint8) {
 	s.clients = &ClientsData{
 		maxClients:        maxClients,
 		connectedClients:  0,
-		clientConnections: make([]net.Conn, maxClients),
+		clientConnections: make([]ClientData, maxClients),
 	}
 
 	fmt.Println("Listening to Connections")
@@ -54,25 +60,34 @@ func (s *Server) InitServer(maxClients uint8) {
 			break
 		}
 
-		go s.handleClientConnection(conn)
+		go s.HandleClientConnection(conn)
 	}
 
 	s.CloseAllConn()
 }
 
-func (s *Server) handleClientConnection(conn net.Conn) {
-	if !s.RegisterClient(conn) {
+func (s *Server) FormatMessage(name string, message string) string {
+	return name + ": " + message
+}
+
+func (s *Server) HandleClientConnection(conn net.Conn) {
+	name, didRegister := s.RegisterClient(conn)
+	if !didRegister {
 		conn.Write([]byte("Max number of registrations have been reached!\n"))
 		return
 	}
 
-	fmt.Println("Registered Client")
+	fmt.Printf("Registered Client %s\n", name)
 
 	buffer := make([]byte, 512)
 
 	for {
 		bytesRead, err := conn.Read(buffer)
 		if err != nil {
+			if err == io.EOF {
+				s.CloseConn(conn, name)
+				return
+			}
 			fmt.Println(err)
 			continue
 		}
@@ -81,68 +96,95 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 
 		if message == "exit" || message == "quit" {
 			fmt.Printf("Closing Conn to %s\n", conn.RemoteAddr().String())
-			s.CloseConn(conn)
+			s.CloseConn(conn, name)
 			break
 		}
-		s.BroadcastMessage(conn, buffer[:bytesRead])
+		s.BroadcastMessage(conn, s.FormatMessage(name, message))
 	}
 }
 
-func (s *Server) CloseConn(conn net.Conn) {
+func (s *Server) CloseConn(conn net.Conn, name string) {
 	s.clients.lock.Lock()
 
 	for i := uint8(0); i < s.clients.maxClients; i++ {
-		if s.clients.clientConnections[i] == nil {
+		if s.clients.clientConnections[i].conn == nil {
 			continue
 		}
-		if s.clients.clientConnections[i].RemoteAddr() == conn.RemoteAddr() {
+		if s.clients.clientConnections[i].conn.RemoteAddr() == conn.RemoteAddr() {
+			fmt.Printf("Closed conn from %s\n", conn.RemoteAddr().String())
+			conn.Write([]byte("close\b255"))
 			conn.Close()
-			s.clients.clientConnections[i] = nil
+			s.clients.clientConnections[i].conn = nil
+			s.clients.connectedClients -= 1
 		}
 	}
 
 	s.clients.lock.Unlock()
+
+	message := name + " has disconnected\n"
+	s.BroadcastMessage(conn, message)
+
+	fmt.Printf("Number of connected clients is now %d\n", s.clients.connectedClients)
 }
 
 func (s *Server) CloseAllConn() {
 	s.clients.lock.Lock()
 
 	for i := uint8(0); i < s.clients.maxClients; i++ {
-		if s.clients.clientConnections[i] != nil {
-			s.clients.clientConnections[i].Close()
+		if s.clients.clientConnections[i].conn != nil {
+			s.clients.clientConnections[i].conn.Close()
+			s.clients.connectedClients -= 1
 		}
-		s.clients.clientConnections[i] = nil
+		s.clients.clientConnections[i].conn = nil
 	}
 
 	s.clients.lock.Unlock()
+
+	fmt.Println("Closed all server connections")
 }
 
-func (s *Server) RegisterClient(conn net.Conn) bool {
+func (s *Server) RegisterClient(conn net.Conn) (string, bool) {
+	nameBuffer := make([]byte, 40)
+	bytesRead, _ := conn.Read(nameBuffer)
+	name := string(nameBuffer[:bytesRead-1])
+
 	s.clients.lock.Lock()
 
 	s.clients.connectedClients += 1
 	didRegister := false
 	for i := uint8(0); i < s.clients.maxClients; i++ {
-		if s.clients.clientConnections[i] == nil {
-			s.clients.clientConnections[i] = conn
+		if s.clients.clientConnections[i].conn == nil {
+			s.clients.clientConnections[i] = ClientData{name: name, conn: conn}
 			didRegister = true
 			break
 		}
 	}
 
 	s.clients.lock.Unlock()
-	return didRegister
+
+	fmt.Printf("Number of connected clients is now %d\n", s.clients.connectedClients)
+
+	if didRegister {
+		message := name + " has joined!\n"
+		s.BroadcastMessage(conn, message)
+	}
+
+	return name, didRegister
 }
 
-func (s *Server) BroadcastMessage(conn net.Conn, message []byte) {
+func (s *Server) BroadcastMessage(conn net.Conn, message string) {
 	fmt.Printf("Broadcasting message from %s\n", conn.RemoteAddr().String())
 
 	s.clients.lock.RLock()
 	for i := uint8(0); i < s.clients.maxClients; i++ {
-		if s.clients.clientConnections[i] == nil {
+		if s.clients.clientConnections[i].conn == nil {
 			continue
 		}
-		_, err := s.clients.clientConnections[i].Write(message)
+		if s.clients.clientConnections[i].conn.RemoteAddr() == conn.RemoteAddr() {
+			continue
+		}
+
+		_, err := s.clients.clientConnections[i].conn.Write([]byte(message))
 		if err != nil {
 			fmt.Println(err)
 		}

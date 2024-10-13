@@ -1,14 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
 )
 
 type Client struct {
-	name       string
 	serverPort uint16
 }
 
@@ -24,40 +25,81 @@ func (c *Client) InitClient() {
 	}
 	defer serverConn.Close()
 
-	go c.ReceiveMessages(serverConn)
-	c.SendMessages(serverConn)
+	fmt.Println("Connected to server!")
+	closeCh := make(chan bool, 1)
+	go c.ReceiveMessages(serverConn, closeCh)
+	c.SendMessages(serverConn, closeCh)
 }
 
-func (c *Client) FormatMessage(message string) string {
-	return c.name + ": " + message
-}
-
-func (c *Client) SendMessages(conn net.Conn) {
+func (c *Client) SendMessages(conn net.Conn, closeCh chan bool) {
 	var message string
-	fmt.Println("Start Entering your messages!")
+
+	fmt.Print("Enter your name: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	message, _ = reader.ReadString('\n')
+	_, err := conn.Write([]byte(message))
+	if err != nil {
+		fmt.Println("Failed to register")
+		fmt.Println("Closing connection")
+		closeCh <- true
+		return
+	}
+
+	fmt.Println("Start entering your messages!")
+
 	for {
-		fmt.Scan(&message)
-		_, err := conn.Write([]byte(c.FormatMessage(message)))
+		message, _ = reader.ReadString('\n')
+		_, err = conn.Write([]byte(message))
 		if err != nil {
-			fmt.Println("failed to write message")
+			select {
+			case <-closeCh:
+				fmt.Println("Server has been closed")
+				return
+			default:
+				if err == io.EOF {
+					fmt.Println("Server has been closed")
+					return
+				}
+				fmt.Println(err)
+				fmt.Println("Failed to write message")
+			}
 		}
 
 		if message == "exit" || message == "quit" {
-			break
+			closeCh <- true
+			return
 		}
 	}
 }
 
-func (c *Client) ReceiveMessages(conn net.Conn) {
+func (c *Client) ReceiveMessages(conn net.Conn, closeCh chan bool) {
 	buffer := make([]byte, 512)
 	for {
 		bytesRead, err := conn.Read(buffer)
 		if err != nil {
-			fmt.Println(err)
-			fmt.Println("failed to read message")
-			break
+			if err == io.EOF {
+				fmt.Println("Server has been closed")
+				closeCh <- true
+				return
+			}
+			select {
+			case <-closeCh:
+				fmt.Println("Server has been closed")
+				return
+			default:
+				fmt.Println(err)
+				fmt.Println("Failed to read message")
+			}
+		}
+		message := string(buffer[:bytesRead])
+
+		if message == "close\b255" {
+			fmt.Println("closed")
+			closeCh <- true
+			return
 		}
 
-		fmt.Println(string(buffer[:bytesRead]))
+		fmt.Print(string(buffer[:bytesRead]))
 	}
 }
